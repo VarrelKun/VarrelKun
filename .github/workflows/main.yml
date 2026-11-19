@@ -1,0 +1,778 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+env:
+  # Password tetap. Kalau repo public, sebaiknya buat secret RDP_PASSWORD
+  # (nilai 'gopalasu27' di bawah hanya dipakai kalau secret tidak ada)
+  RDP_PASSWORD: ${{ secrets.RDP_PASSWORD || 'gopalasu27' }}
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          # Matikan syarat kompleksitas password (password tetap tidak memenuhi 3 dari 4 jenis karakter)
+          secedit /export /cfg "$env:TEMP\sec.cfg" | Out-Null
+          (Get-Content "$env:TEMP\sec.cfg") -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content "$env:TEMP\sec.cfg"
+          secedit /configure /db "$env:windir\security\local.sdb" /cfg "$env:TEMP\sec.cfg" /areas SECURITYPOLICY | Out-Null
+
+          $password = $env:RDP_PASSWORD
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+          # Paksa Windows membuat profil user RDP sekarang,
+          # supaya file bisa dipulihkan SEBELUM kamu login lewat RDP
+          $cred = New-Object System.Management.Automation.PSCredential(".\RDP", $securePass)
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "exit" `
+              -Credential $cred -LoadUserProfile -WorkingDirectory "C:\Windows\System32" -Wait
+          if (-not (Test-Path "C:\Users\RDP\NTUSER.DAT")) {
+              Write-Error "Profil user RDP gagal dibuat"
+              exit 1
+          }
+
+      - name: Restore Session
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}
+          restore-keys: |
+            rdp-session-
+
+      - name: Restore Files and Windows Settings
+        continue-on-error: true
+        run: |
+          # Salin file yang tersimpan kembali ke profil user RDP
+          $data = 'C:\RDPSession\data'
+          if (Test-Path $data) {
+              robocopy $data 'C:\Users\RDP' /E /R:0 /W:0 /MT:8 /NFL /NDL /NJH /NJS /NP | Out-Null
+          }
+
+          # Terapkan pengaturan Windows (registry) yang tersimpan
+          $dir = 'C:\RDPSession\registry'
+          if (-not (Test-Path $dir)) { Write-Host 'Belum ada pengaturan Windows tersimpan'; exit 0 }
+
+          $sid = (Get-LocalUser -Name 'RDP').SID.Value
+          $loaded = Test-Path "Registry::HKEY_USERS\$sid"
+          if ($loaded) {
+              $root = "HKEY_USERS\$sid"
+          } else {
+              $root = 'HKEY_USERS\RDPRestore'
+              reg load 'HKU\RDPRestore' 'C:\Users\RDP\NTUSER.DAT' | Out-Null
+          }
+
+          foreach ($f in Get-ChildItem $dir -Filter *.reg) {
+              # Ganti SID lama di file .reg dengan SID user saat ini
+              $text = (Get-Content $f.FullName -Raw) -replace 'HKEY_USERS\\(S-1-5-21-[0-9-]+|RDPSave)', $root
+              $tmp = Join-Path $env:TEMP $f.Name
+              Set-Content -Path $tmp -Value $text -Encoding Unicode
+              reg import $tmp | Out-Null
+          }
+
+          if (-not $loaded) {
+              [gc]::Collect()
+              Start-Sleep -Seconds 2
+              reg unload 'HKU\RDPRestore' | Out-Null
+          }
+          exit 0
+
+      - name: Prepare Apps, Wallpaper and Save Script
+        run: |
+          # Firefox biasanya sudah ada di runner; kalau belum, install
+          if (-not (Test-Path "C:\Program Files\Mozilla Firefox\firefox.exe")) {
+              choco install firefox -y --no-progress
+          }
+
+          # Wallpaper: taruh gambar bernama wallpaper.jpg/png di folder Pictures,
+          # script ini menerapkannya otomatis setiap kali kamu login
+          $startup = "C:\Users\RDP\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          New-Item -ItemType Directory -Force -Path $startup | Out-Null
+          $wallScript = @'
+          @echo off
+          for %%f in ("C:\Users\RDP\Pictures\wallpaper.*") do (
+            reg add "HKCU\Control Panel\Desktop" /v Wallpaper /t REG_SZ /d "%%~ff" /f >nul
+            reg add "HKCU\Control Panel\Desktop" /v WallpaperStyle /t REG_SZ /d 10 /f >nul
+            reg add "HKCU\Control Panel\Desktop" /v TileWallpaper /t REG_SZ /d 0 /f >nul
+            RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters 1, True
+          )
+          '@
+          Set-Content -Path "$startup\wallpaper.cmd" -Value $wallScript
+
+          # Script penyimpan sesi (dipanggil tiap 15 menit dan saat akhir)
+          New-Item -ItemType Directory -Force -Path C:\rdp-tools | Out-Null
+          $stageScript = @'
+          $ErrorActionPreference = 'Continue'
+          $userHome = 'C:\Users\RDP'
+          $session  = 'C:\RDPSession'
+          $data     = "$session\data"
+          New-Item -ItemType Directory -Force -Path $data | Out-Null
+
+          # ---------- 1. Salin file penting ke folder simpanan (file terkunci dilewati) ----------
+          $items = @(
+              'Desktop', 'Documents', 'Downloads', 'Pictures', 'Music', 'Videos',
+              'AppData\Roaming\Mozilla\Firefox',
+              'AppData\Roaming\discord',
+              'AppData\Local\Discord',
+              'AppData\Roaming\Microsoft\Protect',
+              'AppData\Roaming\Microsoft\Credentials',
+              'AppData\Local\Microsoft\Credentials',
+              'AppData\Local\Roblox',
+              'AppData\Roaming\Roblox',
+              'AppData\Roaming\Microsoft\Windows\Start Menu',
+              'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned'
+          )
+          $xdCache  = @('Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'Crashpad', 'cache2', 'crashes', 'minidumps')
+          $xdRoblox = @("$userHome\AppData\Local\Roblox\logs", "$userHome\AppData\Local\Roblox\Downloads", "$userHome\AppData\Local\Roblox\http")
+          $xf       = @('lock', 'parent.lock', '.parentlock', 'LOCK', 'lockfile')
+
+          foreach ($item in $items) {
+              $src = Join-Path $userHome $item
+              if (-not (Test-Path $src)) { continue }
+              $dst = Join-Path $data $item
+
+              $xd = @()
+              if ($item -like 'AppData*') { $xd += $xdCache }
+              if ($item -eq 'AppData\Local\Roblox') { $xd += $xdRoblox }
+
+              $rc = @($src, $dst, '/MIR', '/R:0', '/W:0', '/MT:8', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+              if ($xd.Count -gt 0) { $rc += '/XD'; $rc += $xd }
+              $rc += '/XF'; $rc += $xf
+              robocopy @rc | Out-Null
+          }
+
+          # ---------- 2. Ekspor pengaturan Windows (registry user) ----------
+          $sid = (Get-LocalUser -Name 'RDP').SID.Value
+          $loaded = Test-Path "Registry::HKEY_USERS\$sid"
+          if ($loaded) {
+              $root = "HKU\$sid"
+          } else {
+              $root = 'HKU\RDPSave'
+              reg load $root "$userHome\NTUSER.DAT" | Out-Null
+          }
+
+          $keys = @(
+              'Control Panel\Desktop',
+              'Control Panel\Colors',
+              'Control Panel\Cursors',
+              'Control Panel\Mouse',
+              'Control Panel\Keyboard',
+              'Control Panel\International',
+              'Control Panel\Accessibility',
+              'Software\Microsoft\Windows\CurrentVersion\Themes',
+              'Software\Microsoft\Windows\CurrentVersion\Search',
+              'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced',
+              'Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3',
+              'Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband',
+              'Software\Microsoft\Windows\DWM',
+              'Software\Roblox',
+              'Software\Classes\roblox-studio',
+              'Software\Classes\roblox-studio-auth',
+              'Software\Classes\Roblox.Place'
+          )
+
+          # Ekspor ke folder sementara dulu, supaya backup lama tidak hilang kalau ekspor gagal
+          $new = "$session\registry_new"
+          Remove-Item $new -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $new | Out-Null
+          $i = 0
+          foreach ($k in $keys) {
+              $i++
+              reg export "$root\$k" "$new\$i.reg" /y 2>$null | Out-Null
+          }
+
+          if (-not $loaded) {
+              [gc]::Collect()
+              Start-Sleep -Seconds 2
+              reg unload $root | Out-Null
+          }
+
+          if ((Get-ChildItem $new -Filter *.reg -ErrorAction SilentlyContinue).Count -gt 0) {
+              Remove-Item "$session\registry" -Recurse -Force -ErrorAction SilentlyContinue
+              Move-Item $new "$session\registry"
+          }
+          Remove-Item $new -Recurse -Force -ErrorAction SilentlyContinue
+
+          # ---------- 3. Cek apakah ada perubahan sejak penyimpanan terakhir ----------
+          $sig = (Get-ChildItem $data -Recurse -File -Force -ErrorAction SilentlyContinue |
+                  ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }) -join "`n"
+          $regSig = (Get-ChildItem "$session\registry" -File -ErrorAction SilentlyContinue |
+                     Get-FileHash | ForEach-Object { $_.Hash }) -join ','
+          $bytes = [Text.Encoding]::UTF8.GetBytes($sig + $regSig)
+          $hash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes))
+
+          $state = 'C:\rdp-tools\last.sig'
+          $changed = $true
+          if (Test-Path $state) {
+              if ((Get-Content $state -Raw).Trim() -eq $hash) { $changed = $false }
+          }
+          Set-Content -Path $state -Value $hash
+          $flag = $changed.ToString().ToLower()
+          Write-Host "Ada perubahan sejak simpan terakhir: $flag"
+          if ($env:GITHUB_OUTPUT) { "changed=$flag" >> $env:GITHUB_OUTPUT }
+          exit 0
+          '@
+          Set-Content -Path C:\rdp-tools\stage.ps1 -Value $stageScript
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Show Access Info
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: (sesuai RDP_PASSWORD)"
+          Write-Host "==================`n"
+          Write-Host "Auto save tiap 15 menit. Kalau sudah selesai, cancel workflow lalu tunggu Final Save Session."
+
+          # Batas waktu sesi: 320 menit dari sekarang (supaya penyimpanan akhir sempat jalan sebelum batas 6 jam)
+          $endTime = [DateTimeOffset]::UtcNow.AddMinutes(320).ToUnixTimeSeconds()
+          "JOB_END=$endTime" >> $env:GITHUB_ENV
+
+      - name: Auto Save 01
+        id: s01
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 01
+        if: steps.restore.outcome == 'success' && steps.s01.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-01
+
+      - name: Auto Save 02
+        id: s02
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 02
+        if: steps.restore.outcome == 'success' && steps.s02.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-02
+
+      - name: Auto Save 03
+        id: s03
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 03
+        if: steps.restore.outcome == 'success' && steps.s03.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-03
+
+      - name: Auto Save 04
+        id: s04
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 04
+        if: steps.restore.outcome == 'success' && steps.s04.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-04
+
+      - name: Auto Save 05
+        id: s05
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 05
+        if: steps.restore.outcome == 'success' && steps.s05.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-05
+
+      - name: Auto Save 06
+        id: s06
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 06
+        if: steps.restore.outcome == 'success' && steps.s06.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-06
+
+      - name: Auto Save 07
+        id: s07
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 07
+        if: steps.restore.outcome == 'success' && steps.s07.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-07
+
+      - name: Auto Save 08
+        id: s08
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 08
+        if: steps.restore.outcome == 'success' && steps.s08.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-08
+
+      - name: Auto Save 09
+        id: s09
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 09
+        if: steps.restore.outcome == 'success' && steps.s09.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-09
+
+      - name: Auto Save 10
+        id: s10
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 10
+        if: steps.restore.outcome == 'success' && steps.s10.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-10
+
+      - name: Auto Save 11
+        id: s11
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 11
+        if: steps.restore.outcome == 'success' && steps.s11.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-11
+
+      - name: Auto Save 12
+        id: s12
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 12
+        if: steps.restore.outcome == 'success' && steps.s12.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-12
+
+      - name: Auto Save 13
+        id: s13
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 13
+        if: steps.restore.outcome == 'success' && steps.s13.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-13
+
+      - name: Auto Save 14
+        id: s14
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 14
+        if: steps.restore.outcome == 'success' && steps.s14.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-14
+
+      - name: Auto Save 15
+        id: s15
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 15
+        if: steps.restore.outcome == 'success' && steps.s15.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-15
+
+      - name: Auto Save 16
+        id: s16
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 16
+        if: steps.restore.outcome == 'success' && steps.s16.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-16
+
+      - name: Auto Save 17
+        id: s17
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 17
+        if: steps.restore.outcome == 'success' && steps.s17.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-17
+
+      - name: Auto Save 18
+        id: s18
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 18
+        if: steps.restore.outcome == 'success' && steps.s18.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-18
+
+      - name: Auto Save 19
+        id: s19
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 19
+        if: steps.restore.outcome == 'success' && steps.s19.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-19
+
+      - name: Auto Save 20
+        id: s20
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 20
+        if: steps.restore.outcome == 'success' && steps.s20.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-20
+
+      - name: Auto Save 21
+        id: s21
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 21
+        if: steps.restore.outcome == 'success' && steps.s21.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-21
+
+      - name: Auto Save 22
+        id: s22
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 22
+        if: steps.restore.outcome == 'success' && steps.s22.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-22
+
+      - name: Auto Save 23
+        id: s23
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 23
+        if: steps.restore.outcome == 'success' && steps.s23.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-23
+
+      - name: Auto Save 24
+        id: s24
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tunggu sampai 15 menit (atau sampai batas waktu), lalu salin file ke folder simpanan
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $sec = [Math]::Min(900, [long]$env:JOB_END - $now)
+          if ($sec -gt 0) { Start-Sleep -Seconds $sec }
+          & C:\rdp-tools\stage.ps1
+
+      - name: Upload Save 24
+        if: steps.restore.outcome == 'success' && steps.s24.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-24
+
+      - name: Close Apps Before Final Save
+        if: always() && steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Tutup aplikasi supaya file login tertulis penuh ke disk
+          Get-Process firefox, Discord, RobloxStudioBeta, RobloxStudioLauncherBeta -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 5
+          exit 0
+
+      - name: Final Stage
+        if: always() && steps.restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          & C:\rdp-tools\stage.ps1
+
+      - name: Final Save Session
+        if: always() && steps.restore.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\RDPSession
+          key: rdp-session-${{ github.run_id }}-${{ github.run_attempt }}-zz-final
