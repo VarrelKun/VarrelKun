@@ -6,7 +6,7 @@ on:
 env:
   # Password tetap. Kalau repo public, sebaiknya buat secret RDP_PASSWORD
   # (nilai 'gopalasu27' di bawah hanya dipakai kalau secret tidak ada)
-  RDP_PASSWORD: ${{ secrets.RDP_PASSWORD || 'gopalasu27' }}
+  RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
 
 jobs:
   secure-rdp:
